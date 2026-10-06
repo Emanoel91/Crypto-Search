@@ -1,6 +1,6 @@
 """
-Market Overview tab  -  Cryptorank Streamlit dashboard
-=======================================================
+Market Overview tab  -  Crypto-Search Dashboard
+================================================
 Uses ONLY endpoints that are available on the free (Sandbox) plan:
 
     GET /v3/global/market        -> Global Market Snapshot
@@ -8,10 +8,7 @@ Uses ONLY endpoints that are available on the free (Sandbox) plan:
     GET /v3/global/altcoin-index -> Altcoin Season Index
 
 Cost: 1 credit per request  ->  3 credits per full refresh.
-Caching keeps usage far below the free quota (10 req/min, 10,000 credits/month).
-
-API key: put it in .streamlit/secrets.toml  ->  CRYPTORANK_API_KEY = "your_key"
-(or set the CRYPTORANK_API_KEY environment variable). Never hard-code it.
+API key: set CRYPTORANK_API_KEY in Streamlit secrets (never hard-code it).
 """
 
 import os
@@ -19,7 +16,6 @@ import re
 import time
 from datetime import datetime, timezone
 
-import pandas as pd
 import plotly.graph_objects as go
 import requests
 import streamlit as st
@@ -27,7 +23,6 @@ import streamlit as st
 BASE_URL = "https://api.cryptorank.io/v3"
 TIMEOUT = 20  # seconds
 
-# Cache lifetimes (seconds)
 TTL_MARKET = 600   # global snapshot: 10 minutes
 TTL_INDEX = 1800   # sentiment indices: 30 minutes
 
@@ -43,7 +38,6 @@ def _get_api_key() -> str:
 
 
 def _request(path: str, api_key: str) -> dict:
-    """Call a Cryptorank v3 endpoint and return {'payload': ..., 'fetched_at': ts}."""
     try:
         resp = requests.get(
             f"{BASE_URL}{path}",
@@ -54,7 +48,6 @@ def _request(path: str, api_key: str) -> dict:
         raise RuntimeError(f"Network error while calling {path}: {exc}") from exc
 
     if resp.status_code != 200:
-        # Error envelope format is documented at docs.cryptorank.io/errors
         detail = resp.text[:300]
         if resp.status_code in (401, 403):
             hint = "Check your API key / plan permissions."
@@ -66,7 +59,7 @@ def _request(path: str, api_key: str) -> dict:
 
     body = resp.json()
     payload = body.get("data", body) if isinstance(body, dict) else body
-    return {"payload": payload, "raw": body, "fetched_at": time.time()}
+    return {"payload": payload, "fetched_at": time.time()}
 
 
 @st.cache_data(ttl=TTL_MARKET, show_spinner=False)
@@ -85,7 +78,6 @@ def fetch_altcoin_index(api_key: str) -> dict:
 
 
 def _safe(fetcher, api_key):
-    """Return (result, error_message). One failing endpoint must not break the tab."""
     try:
         return fetcher(api_key), None
     except Exception as exc:  # noqa: BLE001
@@ -123,8 +115,8 @@ def _to_float(v):
 
 
 def pick(flat: dict, include, exclude=()):
-    """Find the numeric field whose (normalized) name contains all `include` words
-    and none of `exclude`. Shortest matching name wins. Returns (key, float|None)."""
+    """Numeric field whose normalized name contains all `include` words and none
+    of `exclude` (shortest name wins). Returns (key, float|None)."""
     best = None
     for k, v in flat.items():
         nk = _norm(k)
@@ -135,6 +127,15 @@ def pick(flat: dict, include, exclude=()):
             if best is None or len(nk) < best[0]:
                 best = (len(nk), k, num)
     return (best[1], best[2]) if best else (None, None)
+
+
+def pick_first(flat: dict, attempts):
+    """Try several (include, exclude) combinations in order."""
+    for include, exclude in attempts:
+        _, val = pick(flat, include, exclude)
+        if val is not None:
+            return val
+    return None
 
 
 def pick_text(flat: dict, words, exclude=()):
@@ -159,110 +160,95 @@ def fmt_usd(n):
     return f"${n:,.0f}"
 
 
-def fmt_num(n):
+def fmt_int(n):
     return "N/A" if n is None else f"{n:,.0f}"
 
 
 def fmt_pct(n):
-    return None if n is None else f"{n:+.2f}%"
+    return "N/A" if n is None else f"{n:+.2f}%"
 
 
 # ----------------------------------------------------------------------------
 # UI blocks
 # ----------------------------------------------------------------------------
-def _kpi(col, label, value_str, delta=None):
-    col.metric(label, value_str, delta=delta)
+_CHG_EXCL = ["change", "percent", "dominance", "ath", "ratio"]
 
 
 def render_kpis(payload: dict):
     flat = flatten(payload)
 
-    _, mcap = pick(flat, ["marketcap"], exclude=["change", "percent", "dominance", "ath"])
-    _, mcap_chg = pick(flat, ["marketcap", "change"])
-    _, vol = pick(flat, ["volume"], exclude=["change", "percent", "dominance"])
-    _, vol_chg = pick(flat, ["volume", "change"])
-    _, btc_dom = pick(flat, ["btc", "dominance"])
-    if btc_dom is None:
-        _, btc_dom = pick(flat, ["bitcoin", "dominance"])
-    _, eth_dom = pick(flat, ["eth", "dominance"])
-    if eth_dom is None:
-        _, eth_dom = pick(flat, ["ethereum", "dominance"])
-    _, coins = pick(flat, ["coins"], exclude=["change"])
-    if coins is None:
-        _, coins = pick(flat, ["currencies"], exclude=["change"])
-    _, exchanges = pick(flat, ["exchanges"], exclude=["change"])
+    total_mcap = pick_first(flat, [
+        (["total", "marketcap"], _CHG_EXCL + ["btc", "eth", "bitcoin", "ethereum"]),
+        (["marketcap"], _CHG_EXCL + ["btc", "eth", "bitcoin", "ethereum"]),
+    ])
+    total_vol = pick_first(flat, [
+        (["total", "volume"], ["change", "percent", "ratio"]),
+        (["volume"], ["change", "percent", "ratio"]),
+    ])
+    mcap_change = pick_first(flat, [
+        (["marketcap", "change", "24"], ["btc", "eth"]),
+        (["marketcap", "change"], ["btc", "eth"]),
+    ])
+    btc_mcap = pick_first(flat, [
+        (["btc", "marketcap"], ["change", "percent", "dominance"]),
+        (["bitcoin", "marketcap"], ["change", "percent", "dominance"]),
+    ])
+    eth_mcap = pick_first(flat, [
+        (["eth", "marketcap"], ["change", "percent", "dominance"]),
+        (["ethereum", "marketcap"], ["change", "percent", "dominance"]),
+    ])
+    active_cur = pick_first(flat, [
+        (["active", "currenc"], ["change"]),
+        (["active", "coin"], ["change"]),
+        (["currenc"], ["change"]),
+        (["coins"], ["change"]),
+    ])
+    active_exc = pick_first(flat, [
+        (["active", "exchange"], ["percent", "pct", "delta"]),
+        (["exchange"], ["percent", "pct", "delta"]),
+    ])
 
+    mcap_to_vol = (total_mcap / total_vol) if (total_mcap and total_vol) else None
+    btc_dom = (btc_mcap / total_mcap * 100) if (btc_mcap is not None and total_mcap) else None
+    eth_dom = (eth_mcap / total_mcap * 100) if (eth_mcap is not None and total_mcap) else None
+
+    # Row 1
     c1, c2, c3, c4 = st.columns(4)
-    _kpi(c1, "Total Market Cap", fmt_usd(mcap), fmt_pct(mcap_chg))
-    _kpi(c2, "24h Trading Volume", fmt_usd(vol), fmt_pct(vol_chg))
-    _kpi(c3, "BTC Dominance", "N/A" if btc_dom is None else f"{btc_dom:.2f}%")
-    _kpi(c4, "ETH Dominance", "N/A" if eth_dom is None else f"{eth_dom:.2f}%")
+    c1.metric("Total MarketCap", fmt_usd(total_mcap))
+    c2.metric("Total Volume (24h)", fmt_usd(total_vol))
+    c3.metric("MarketCap/Volume", "N/A" if mcap_to_vol is None else f"{mcap_to_vol:,.2f}")
+    c4.metric("%MarketCap Change (24h)", fmt_pct(mcap_change))
 
-    if coins is not None or exchanges is not None:
-        d1, d2, _, _ = st.columns(4)
-        if coins is not None:
-            _kpi(d1, "Tracked Coins", fmt_num(coins))
-        if exchanges is not None:
-            _kpi(d2, "Tracked Exchanges", fmt_num(exchanges))
+    # Row 2
+    d1, d2, d3, d4 = st.columns(4)
+    d1.metric("BTC MarketCap", fmt_usd(btc_mcap))
+    d1.caption("BTC Dominance: " + ("N/A" if btc_dom is None else f"{btc_dom:.2f}%"))
+    d2.metric("ETH MarketCap", fmt_usd(eth_mcap))
+    d2.caption("ETH Dominance: " + ("N/A" if eth_dom is None else f"{eth_dom:.2f}%"))
+    d3.metric("Active Currencies", fmt_int(active_cur))
+    d4.metric("Active Exchanges", fmt_int(active_exc))
 
-    return btc_dom, eth_dom
-
-
-def render_dominance_chart(btc_dom, eth_dom):
-    if btc_dom is None or eth_dom is None:
-        st.info("Dominance data was not found in the API response.")
-        return
-    # Accept both 0-1 fractions and 0-100 percentages.
-    scale = 100 if (btc_dom + eth_dom) <= 1.0 else 1
-    btc, eth = btc_dom * scale, eth_dom * scale
-    others = max(0.0, 100 - btc - eth)
-
-    fig = go.Figure(
-        go.Pie(
-            labels=["Bitcoin", "Ethereum", "Others"],
-            values=[btc, eth, others],
-            hole=0.55,
-            marker=dict(colors=["#F7931A", "#627EEA", "#9CA3AF"]),
-            textinfo="label+percent",
-            sort=False,
-        )
-    )
-    fig.update_layout(
-        title="Market Cap Dominance",
-        height=380,
-        margin=dict(t=60, b=20, l=20, r=20),
-        showlegend=False,
-        paper_bgcolor="rgba(0,0,0,0)",
-    )
-    st.plotly_chart(fig, use_container_width=True)
-
-
-def render_all_metrics(payload: dict):
-    flat = flatten(payload)
-    rows = [
-        {"Field": k, "Value": v}
-        for k, v in flat.items()
-        if v is not None and not isinstance(v, (list, dict))
-    ]
-    if rows:
-        df = pd.DataFrame(rows)
-        df["Value"] = df["Value"].astype(str)
-        st.dataframe(df, use_container_width=True, hide_index=True, height=380)
-    else:
-        st.info("No scalar fields found.")
+    missing = [name for name, val in [
+        ("Total MarketCap", total_mcap), ("Total Volume", total_vol),
+        ("MarketCap Change", mcap_change), ("BTC MarketCap", btc_mcap),
+        ("ETH MarketCap", eth_mcap), ("Active Currencies", active_cur),
+        ("Active Exchanges", active_exc),
+    ] if val is None]
+    if missing:
+        st.warning("Fields not found in the API response: " + ", ".join(missing))
 
 
 def render_index_card(title: str, payload: dict, steps: list):
-    """Gauge (0-100) for an index + a table with the remaining fields."""
+    """Gauge (0-100) showing the index value and its classification."""
     flat = flatten(payload)
     prev_words = ["previous", "prev", "yesterday", "week", "month", "year", "last"]
 
-    key, value = pick(flat, ["value"], exclude=prev_words)
-    if value is None:  # fall back to the first numeric field
-        for k, v in flat.items():
+    _, value = pick(flat, ["value"], exclude=prev_words)
+    if value is None:
+        for v in flat.values():
             num = _to_float(v)
             if num is not None:
-                key, value = k, num
+                value = num
                 break
 
     label = pick_text(flat, ["classification", "label", "status", "category", "name"],
@@ -271,44 +257,37 @@ def render_index_card(title: str, payload: dict, steps: list):
     st.subheader(title)
     if value is None:
         st.warning("Could not find a numeric value in the response.")
-    else:
-        fig = go.Figure(
-            go.Indicator(
-                mode="gauge+number",
-                value=value,
-                title={"text": label or ""},
-                gauge={
-                    "axis": {"range": [0, 100]},
-                    "bar": {"color": "#111827", "thickness": 0.25},
-                    "steps": steps,
-                },
-            )
-        )
-        fig.update_layout(height=300, margin=dict(t=60, b=10, l=30, r=30),
-                          paper_bgcolor="rgba(0,0,0,0)")
-        st.plotly_chart(fig, use_container_width=True)
+        return
 
-    rows = [
-        {"Field": k, "Value": str(v)}
-        for k, v in flat.items()
-        if k != key and v is not None and not isinstance(v, (list, dict))
-    ]
-    if rows:
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    fig = go.Figure(
+        go.Indicator(
+            mode="gauge+number",
+            value=value,
+            title={"text": label or ""},
+            gauge={
+                "axis": {"range": [0, 100]},
+                "bar": {"color": "#111827", "thickness": 0.25},
+                "steps": steps,
+            },
+        )
+    )
+    fig.update_layout(height=300, margin=dict(t=60, b=10, l=30, r=30),
+                      paper_bgcolor="rgba(0,0,0,0)")
+    st.plotly_chart(fig, use_container_width=True)
 
 
 FEAR_GREED_STEPS = [
-    {"range": [0, 25], "color": "#EF4444"},    # Extreme fear
-    {"range": [25, 45], "color": "#F97316"},   # Fear
-    {"range": [45, 55], "color": "#EAB308"},   # Neutral
-    {"range": [55, 75], "color": "#84CC16"},   # Greed
-    {"range": [75, 100], "color": "#22C55E"},  # Extreme greed
+    {"range": [0, 25], "color": "#EF4444"},
+    {"range": [25, 45], "color": "#F97316"},
+    {"range": [45, 55], "color": "#EAB308"},
+    {"range": [55, 75], "color": "#84CC16"},
+    {"range": [75, 100], "color": "#22C55E"},
 ]
 
 ALTCOIN_STEPS = [
-    {"range": [0, 25], "color": "#F7931A"},    # Bitcoin season
-    {"range": [25, 75], "color": "#D1D5DB"},   # Mixed
-    {"range": [75, 100], "color": "#3B82F6"},  # Altcoin season
+    {"range": [0, 25], "color": "#F7931A"},
+    {"range": [25, 75], "color": "#D1D5DB"},
+    {"range": [75, 100], "color": "#3B82F6"},
 ]
 
 
@@ -317,13 +296,12 @@ ALTCOIN_STEPS = [
 # ----------------------------------------------------------------------------
 def render():
     st.header("📊 Market Overview")
-    st.caption("Global crypto market snapshot and sentiment indices · Source: Cryptorank API v3")
 
     api_key = _get_api_key()
     if not api_key:
         st.error(
-            "API key not found. Add `CRYPTORANK_API_KEY = \"...\"` to "
-            "`.streamlit/secrets.toml` (or set it as an environment variable)."
+            "API key not found. Add `CRYPTORANK_API_KEY = \"...\"` to the app's "
+            "Secrets (or set it as an environment variable)."
         )
         return
 
@@ -343,26 +321,15 @@ def render():
             st.caption(f"Snapshot fetched at {ts:%Y-%m-%d %H:%M} UTC · cached up to "
                        f"{TTL_MARKET // 60} min")
 
-    # --- 1) Global market KPIs ------------------------------------------------
+    # KPI rows
     if err_market:
         st.error(f"Global market snapshot failed: {err_market}")
-        btc_dom = eth_dom = None
     else:
-        btc_dom, eth_dom = render_kpis(market["payload"])
+        render_kpis(market["payload"])
 
     st.divider()
 
-    # --- 2) Dominance + all snapshot fields ----------------------------------
-    if market:
-        left, right = st.columns(2)
-        with left:
-            render_dominance_chart(btc_dom, eth_dom)
-        with right:
-            st.subheader("All snapshot fields")
-            render_all_metrics(market["payload"])
-        st.divider()
-
-    # --- 3) Sentiment indices --------------------------------------------------
+    # Sentiment gauges
     g1, g2 = st.columns(2)
     with g1:
         if err_fng:
@@ -374,11 +341,3 @@ def render():
             st.error(f"Altcoin Season Index failed: {err_alt}")
         elif alt:
             render_index_card("Altcoin Season Index", alt["payload"], ALTCOIN_STEPS)
-
-    # --- 4) Raw responses (useful for debugging field names) ------------------
-    with st.expander("🛠 Raw API responses"):
-        for name, res in (("global/market", market), ("global/fear-greed", fng),
-                          ("global/altcoin-index", alt)):
-            if res:
-                st.markdown(f"**{name}**")
-                st.json(res["raw"], expanded=False)
