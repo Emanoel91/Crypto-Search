@@ -1,5 +1,6 @@
 import streamlit as st
 
+import market_explorer
 import market_overview
 
 st.set_page_config(page_title="Crypto-Search Dashboard", page_icon="📊", layout="wide")
@@ -31,7 +32,10 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-tab_overview, = st.tabs(["📊 Market Overview"])
+tab_overview, tab_explorer = st.tabs(["📊 Market Overview", "🔍 Market Explorer"])
 
 with tab_overview:
     market_overview.render()
+
+with tab_explorer:
+    market_explorer.render()
